@@ -1,0 +1,90 @@
+    uint8_t buf_str[128] = {0};     //无用信息存放
+    uint8_t message_buf[128] = {0};
+    static Union_BootLoader_PARM BootLoader;
+
+    static uint8_t msg_buf[96] = {0};   //数据域
+    
+    static uint8_t phone_number[12] = {0};  //手机号
+    
+    static uint8_t msg_pwd[6] = {0};    //通讯密码
+    static uint8_t msg_ctrl = 0;    //控制域
+    
+    static uint8_t ftp_ip_port[22] = {0};
+    static uint8_t ftp_name[16] = {0};
+    static uint8_t ftp_pwd[16] = {0};
+    static uint8_t ftp_filename[16] = {0};
+    
+    static uint8_t dev_id[5] = {0};     //设备ID号
+    static uint8_t channel = 0;     //信道号
+    static uint8_t tcp_ip_port[22] = {0};       //TCP IP Port
+    
+    static uint16_t port;
+    static B16_B08 Port;    
+       
+       
+            sscanf(ucRxBuf, "%[^,],\"%[^\"]%[^\n]\n%[^;]", buf_str, phone_number, buf_str, message_buf);    //提取手机号和短信内容
+            /*****************判断手机号是否有"+86"*************************/
+            if(strstr(phone_number, "+86") != NULL)
+            {
+                memcpy(BootLoader.Str_BootLoader_PARM.PhoneNum, &phone_number[3], sizeof(phone_number)-3); 
+                memcpy(ConfigInfo.PhoneNum, &phone_number[3], sizeof(phone_number)-3);
+            }
+            else
+            {
+                memcpy(BootLoader.Str_BootLoader_PARM.PhoneNum, phone_number, sizeof(phone_number));                
+                memcpy(ConfigInfo.PhoneNum, phone_number, sizeof(phone_number));         
+            }           
+            
+            sscanf(message_buf, "%[^:]:%[^,],%d,%[^;]", buf_str, msg_pwd, &msg_ctrl, msg_buf);     //提取通讯密码和控制位
+            
+            if(strstr(msg_pwd, MsgPwd) != NULL)     //判断密码是否正确
+            {
+                
+                if(msg_ctrl == SMS_Info_Set)        //配置信息
+                {
+                    sscanf(msg_buf, "%x,%d,%[^,]",dev_id, &channel, tcp_ip_port);     //提取配置信息
+                    
+                    /**************************写配置信息*********************************/
+                    memcpy(ConfigInfo.DevID, dev_id, sizeof(dev_id));
+                    ConfigInfo.LoraChannel = channel;
+                    memcpy(ConfigInfo.TcpIpPort, tcp_ip_port, sizeof(tcp_ip_port));  
+                    
+                    sscanf(ConfigInfo.TcpIpPort, "%d.%d.%d.%d:%d",&ConfigInfo.IpPort[0], &ConfigInfo.IpPort[1], &ConfigInfo.IpPort[2], &ConfigInfo.IpPort[3], &port);
+                    Port.B16 = port;
+                    ConfigInfo.IpPort[4] = Port.B8[1];
+                    ConfigInfo.IpPort[5] = Port.B8[0];                    
+                    
+                    CreateGateWayConfigInfoFile();
+                    return SMS_Info_Set;                    
+                }              
+                
+                else if(msg_ctrl == SMS_Software_Reset)
+                {
+                    return SMS_Software_Reset;
+                }
+                else if(msg_ctrl == SMS_Hardware_Reset)
+                {
+                    return SMS_Hardware_Reset;
+                }
+                else if(msg_ctrl == SMS_IAP_Ctrl)       //IAP
+                {   /*******************写升级标志位********************/
+                    BootLoader.Str_BootLoader_PARM.IAPState[0] = 0x11;  
+                    BootLoader.Str_BootLoader_PARM.IAPState[1] = 0x22;
+                    
+                    sscanf(msg_buf, "%[^,],%[^,],%[^,],%[^,]", ftp_ip_port, ftp_name, ftp_pwd, ftp_filename);   //提取FTP服务器配置信息
+                    
+                    /*******************写FTP服务器配置信息********************/
+                    memcpy(BootLoader.Str_BootLoader_PARM.FtpIpPort, ftp_ip_port, sizeof(ftp_ip_port));
+                    memcpy(BootLoader.Str_BootLoader_PARM.FtpName, ftp_name, sizeof(ftp_name));
+                    memcpy(BootLoader.Str_BootLoader_PARM.FtpPwd, ftp_pwd, sizeof(ftp_pwd));
+                    memcpy(BootLoader.Str_BootLoader_PARM.FtpFileName, ftp_filename, sizeof(ftp_filename));
+                    
+                    bsp_WriteCpuFlash(FLASH_IAP_info, BootLoader.buf, 100);
+                    return SMS_IAP_Ctrl;
+                } 
+                else
+                {
+                    return SMS_Error;
+                }
+                
+            }

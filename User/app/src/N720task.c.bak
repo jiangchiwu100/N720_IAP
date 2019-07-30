@@ -1,0 +1,669 @@
+#include "includes.h"
+
+Enum_Message_JudgeAndGet JudgeAndGet;
+
+
+OS_STK AppTaskSMSCommStk[APP_TASK_SMSComm_STK_SIZE];	
+OS_STK AppTaskN720InitStk[APP_TASK_N720Init_STK_SIZE];	
+
+
+void AppTaskSMSComm(void *p_arg)
+{
+  static uint32_t SMSCommDelay = 0;
+  (void)p_arg;	 /* 避免编译器告警 */
+  
+  while (1) 
+  {      
+      SMSCommDelay = N720_JudgeAndGet();//RxMsg
+      if(SMSCommDelay == Task_Suspend)
+      {
+          OSTaskSuspend(APP_TASK_SMSComm_PRIO);
+      }
+      else
+      {
+          OSTimeDly(SMSCommDelay);
+      }
+  }
+}
+
+void AppTaskN720Init(void *p_arg)
+{
+  static uint32_t N720InitDelay = 0;
+  (void)p_arg;	 /* 避免编译器告警 */
+  
+  while (1) 
+  {
+      N720InitDelay = N720_Init();//Init
+      if(N720InitDelay == Task_Suspend)
+      {
+          OSTaskSuspend(APP_TASK_N720Init_PRIO);   
+      }
+      else
+      {
+          OSTimeDly(N720InitDelay);
+      }
+  }
+}
+
+
+uint32_t N720_Init(void)
+{
+    uint8_t Num = 0;
+    uint32_t delay = 0;
+    static Enum_N720_Init N720InitAllStateMachine = Enum_N720_Check_AT;
+    
+    switch (N720InitAllStateMachine)
+    {
+      case Enum_N720_Check_AT:    //检查模块通讯
+        {
+			W_State(&SysState,N720Register,false);
+            W_State(&SysState,TCPRegister,false);
+            printf("*******Enum_N720_Check_AT**********\n\r");
+            
+            if (N720_Forbidden_Command_Display() == true)
+            {
+                N720InitAllStateMachine = Enum_N720_Check_Internet;   //模块通讯成功 开始检测联网
+                delay = 1000;
+            }
+            else 
+            {
+                N720InitAllStateMachine = Enum_N720_Init_State;    //模块通讯失败 初始化模块
+                delay = 1000;              
+            }
+        }
+        break;   
+      case Enum_N720_Check_Internet:    //检查模块联网状态
+        {
+			W_State(&SysState,N720Register,false);
+            printf("*******Enum_N720_Check_Internet**********\n\r");
+            
+            if (N720_Check_Connection() == true)
+            {
+                N720InitAllStateMachine = Enum_N720_Init_SMS;   //模块在网 直接开始发送短信
+                delay = 1000;
+            }
+            else 
+            {
+                N720InitAllStateMachine = Enum_N720_Init_State;    //模块不在网 初始化模块
+                delay = 1000;              
+            }
+        }
+        break;
+      case Enum_N720_Init_State:     //初始化N720状态
+        {
+			W_State(&SysState,N720Register,false);
+            printf("*******Enum_N720_Init_State**********\n\r");
+            
+            delay = N720_State_Init();
+            if (delay == Init_Success)
+            {
+                N720InitAllStateMachine = Enum_N720_Init_SMS;   //模块初始化完毕 开始初始化短信配置
+                delay = 1000;
+            }
+			else if(delay == Init_Fail)//4G有故障   1分钟之后在进行初始化 
+			{
+				delay = 60000;
+				N720InitAllStateMachine = Enum_N720_Check_AT;
+			}
+            else 
+            {
+                N720InitAllStateMachine = Enum_N720_Init_State;    //模块初始化尚未完成 继续初始化 
+            }
+        }
+        break;
+      case Enum_N720_Init_SMS:      //初始化短信配置
+        {
+            printf("*******Enum_N720_Init_SMS**********\n\r");
+            
+            delay = N720_SMS_Init();
+            if (delay     == SMS_Success)       //短信配置初始化完成 开始初始化TCP
+            {                
+//				W_State(&SysState,N720Register,true);
+                N720InitAllStateMachine = Enum_N720_Init_TCP;                    
+                delay = 1000;
+            }
+            else if (delay == SMS_Fail)         //短信配置初始化失败 开始初始化N720
+            {
+				W_State(&SysState,N720Register,false);
+				delay = 1000;
+                N720InitAllStateMachine = Enum_N720_Init_State;     
+            }
+            else
+            {
+				W_State(&SysState,N720Register,false);
+                N720InitAllStateMachine = Enum_N720_Init_SMS;    //短信配置初始化尚未完成 继续初始化 
+            }
+        }
+        break;
+      case Enum_N720_Init_TCP:      //初始化TCP配置
+        {
+            printf("*******Enum_N720_Init_TCP**********\n\r");
+            
+            if(_memcmp(&ConfigInfo.TcpIpPort[0] , 0 ,22) == false)//如果IP地址不是空 就进行配置TCP  
+            {
+                delay = N720_TCP_Init();
+                if(delay      == TCP_Success)    //TCP初始化成功 初始化完毕 挂起
+                {
+                    W_State(&SysState,TCPRegister,true);
+                    N720InitAllStateMachine = Enum_N720_JudgeAndGet;
+                    delay = 0;
+                }
+                else if(delay == TCP_Fail)       //说明IP地址配置 或者其他配置有问题  短信可以使用
+                {
+                    N720InitAllStateMachine = Enum_N720_JudgeAndGet;     //TCP配置初始化失败 开始初始化N720
+                    delay = 0;                
+                }
+                else
+                {
+                    N720InitAllStateMachine = Enum_N720_Init_TCP;    //TCP配置初始化尚未完成 继续初始化                 
+                }                
+            }
+            else //还不能收发TCP数据 等待短信消息
+            {
+				delay = 1000;   
+                N720InitAllStateMachine = Enum_N720_JudgeAndGet;            
+            }
+        }
+        break;
+      case Enum_N720_JudgeAndGet:
+        {
+            printf("*******Enum_N720_Judge_Msg_Type**********\n\r");
+            
+            
+            switch(N720_Judge_Type(&Num))
+            {
+              case SMS_Type:
+                {
+                    //把数据读取到缓存区里面 
+                    OSSemPost(SempSMSRx);     //传递信号量 N720         
+                }
+                break;
+              case TCP_Type:
+                {
+                    //把数据读取到缓存区里面 
+                    OSSemPost(SempTCPRx);     //传递信号量 N720    
+                }
+                break;
+              default:
+                break;
+            }
+            delay = 0;//立刻去等待 防止有多条数据下发下来
+            N720InitAllStateMachine = Enum_N720_Judge_Msg_Type;            
+        }
+        break;
+      default:
+        break; 
+    }
+    
+    return delay;
+}
+
+
+
+/**********  N720_SendAT("AT+CMGD=0,4");   //清除所有短信**/
+uint32_t N720_State_Init(void)//返回延时时间  ms
+{
+    uint32_t delay = 0;
+    static Enum_N720_State N720InitStateMachine = Enum_N720_PowerOn_Disable;
+    static uint8_t N720InitLoop = 0;
+    static uint8_t AttachLoop = 0;
+    static uint8_t Reset_flag = 0;
+    
+    switch(N720InitStateMachine)
+    {
+      case Enum_N720_PowerOn_Disable:     //拉低poweron引脚 开机成功 然后延时15s 
+        { 
+            N720InitLoop ++;            
+            if (N720InitLoop < 2)
+            {
+                N720_RST_GPIO(false);
+                delay = 1000;
+                printf("********%d*******************\n\r", N720InitStateMachine);
+            }
+            else 
+            {
+                Reset_flag ++;      //重启计数
+                N720InitLoop = 0;
+                N720_RST_GPIO(true);
+                N720InitStateMachine = Enum_N720_Check_Report;
+                printf("********%d*******************\n\r", N720InitStateMachine);
+                delay = 15000;                
+            }
+            
+            if (Reset_flag > 3)     //重启超过3次 初始化失败
+            {
+				N720InitLoop = 0;
+				AttachLoop = 0;
+				Reset_flag = 0;
+				delay = Init_Fail; 
+                N720InitStateMachine = Enum_N720_PowerOn_Disable;
+            }
+            
+        }
+        break;
+      case Enum_N720_Check_Report:    //拉发送“AT”检查串口是否已通
+        {
+            if (N720_Check_Report() == true)
+            {
+                printf("********%d*******************\n\r", N720InitStateMachine);
+                
+                N720InitStateMachine = Enum_N720_FCDisplay;     //串口通讯成功 关闭回显
+                delay = 300;
+            }
+            else
+            {
+                N720InitStateMachine = Enum_N720_PowerOn_Disable;   //失败 重启模块
+                delay = 1000;
+            }	
+        }
+        break;
+      case Enum_N720_FCDisplay:         //关闭回显
+        {
+            if (N720_Forbidden_Command_Display() == true)
+            {
+                printf("********%d*******************\n\r", N720InitStateMachine);
+                
+                N720InitStateMachine = Enum_N720_Check_SIMCard;     //检查SIM卡
+                delay = 300;
+                
+            }
+            else 
+            {
+                N720InitStateMachine = Enum_N720_Check_Report;      //再次检测串口通讯
+                delay = 1000;
+            }
+            
+        }
+        break;
+      case Enum_N720_Check_SIMCard:         //检查SIM卡
+        {
+            if (N720_Check_SIMCard() == true)
+            {
+                printf("********%d*******************\n\r", N720InitStateMachine);
+                
+                N720InitStateMachine = Enum_N720_Query_Net_Reg;     //检查网络注册
+                delay = 300;
+            }
+            else 
+            {
+                N720InitStateMachine = Enum_N720_PowerOn_Disable;   //失败 重启模块
+                delay = 1000;              
+            }
+        }
+        break;
+      case Enum_N720_Query_Net_Reg:     //检查网络注册
+        {
+            if (N720_Query_Network_Registration() == true)
+            {
+                printf("********%d*******************\n\r", N720InitStateMachine);
+                
+                N720InitStateMachine = Enum_N720_Query_Net_Attach;     //检查网络附着
+                delay = 300;
+            }
+            else 
+            {
+                N720InitStateMachine = Enum_N720_PowerOn_Disable;    //失败 重启模块
+                delay = 1000;              
+            }
+        }
+        break;  
+      case Enum_N720_Query_Net_Attach:      //检查网络附着
+        {
+            
+            if (N720_Query_Network_Attach() == true)
+            {
+                printf("********%d*******************\n\r", N720InitStateMachine);
+                AttachLoop = 0;
+                N720InitStateMachine = Enum_N720_Enable_Reporting;     //开启主动上报
+                delay = 300;
+            }
+            else 
+            {
+                AttachLoop++;       //附着失败计数
+                if (N720_Active_Attachment() == true)   //进行主动附着
+                {
+                    N720InitStateMachine = Enum_N720_Query_Net_Attach;  //成功 检查附着状态
+                    delay = 3000;
+                }
+                if (AttachLoop >= 10)
+                {
+					AttachLoop = 0;
+                    N720InitStateMachine = Enum_N720_PowerOn_Disable;   //失败 重启模块
+                }
+                
+            }
+            
+        }
+        break;
+      case Enum_N720_Enable_Reporting:      
+        {
+            if (N720_Enable_Reporting() == true)
+            {
+                printf("********%d*******************\n\r", N720InitStateMachine);
+                
+                N720InitStateMachine = Enum_N720_Set_APN;     //设置APN参数
+                delay = 300;
+            }
+            else 
+            {
+                N720InitStateMachine = Enum_N720_PowerOn_Disable;      //失败 重启模块
+                delay = 1000;              
+            }
+        }
+        break;
+      case Enum_N720_Set_APN:
+        {
+            if (N720_Set_APN() == true)
+            {
+                printf("********%d*******************\n\r", N720InitStateMachine);
+                
+                N720InitStateMachine = Enum_N720_Set_USERPWD;     //设置APN用户名密码
+                delay = 300;
+            }
+            else 
+            {
+                N720InitStateMachine = Enum_N720_PowerOn_Disable;
+                delay = 1000;              
+            }
+        }
+        break;
+      case Enum_N720_Set_USERPWD:
+        {
+            if (N720_Set_USERPWD() == true)
+            {
+                printf("********%d*******************\n\r", N720InitStateMachine);
+                
+                N720InitStateMachine = Enum_N720_Net_Connection;     //主动联网
+                delay = 300;
+            }
+            else 
+            {
+                N720InitStateMachine = Enum_N720_PowerOn_Disable;
+                delay = 1000;              
+            }
+        }
+        break;
+      case Enum_N720_Net_Connection:
+        {
+            if (N720_Network_Connection() == true)
+            {
+                printf("********%d*******************\n\r", N720InitStateMachine);
+                
+                N720InitStateMachine = Enum_N720_Check_Connection;     //检查联网
+                delay = 300;
+            }
+            else 
+            {
+                N720InitStateMachine = Enum_N720_PowerOn_Disable;
+                delay = 1000;              
+            }
+        }
+        break;
+      case Enum_N720_Check_Connection:
+        {
+            if (N720_Check_Connection() == true)
+            {
+                printf("********%d*******************\n\r", N720InitStateMachine);
+				N720InitLoop = 0;
+				AttachLoop = 0;
+				Reset_flag = 0;
+                N720InitStateMachine = Enum_N720_PowerOn_Disable;
+                delay = Init_Success;   //联网成功 初始化完成
+            }
+            else 
+            {
+                N720InitStateMachine = Enum_N720_PowerOn_Disable;
+                delay = 1000;              
+            }
+        }
+        break;
+      default:
+        break;
+    }
+    return(delay);
+}
+
+uint32_t N720_TCP_Init(void)
+{
+    uint32_t delay = 0;
+    static Enum_N720_TCP N720TCPStateMachine = Enum_N720_Set_TCP;
+    static uint8_t data[6] = {0};
+    static uint8_t TCP_Init_flag = 0;
+    
+    switch(N720TCPStateMachine)
+    {
+      case Enum_N720_Close_TCP:
+        {
+            TCP_Init_flag++;
+            if (N720_Close_TCP() == true)
+            {
+                printf("********%d*******************\n\r", N720TCPStateMachine);
+                
+                N720TCPStateMachine = Enum_N720_Set_TCP;
+                delay = 1000;
+            }
+            else 
+            {
+                N720TCPStateMachine = Enum_N720_Set_TCP;
+                delay = 1000;              
+            }
+            if(TCP_Init_flag > 3)
+            {
+				delay = TCP_Fail;  
+                TCP_Init_flag = 0;
+                N720TCPStateMachine = Enum_N720_Close_TCP;
+            }
+        }
+        break;
+      case Enum_N720_Set_TCP:
+        {
+            if (N720_Set_TCP(ConfigInfo.TcpIpPort) == true)
+            {
+                printf("********%d*******************\n\r", N720TCPStateMachine);
+                printf("%s\n", data);
+                N720TCPStateMachine = Enum_N720_Open_TCP;
+                delay = 300;
+            }
+            else 
+            {
+                N720TCPStateMachine = Enum_N720_Close_TCP;
+                delay = 1000;              
+            }
+        }
+        break;
+      case Enum_N720_Open_TCP:
+        {
+            if (N720_Open_TCP() == true)
+            {
+                printf("********%d*******************\n\r", N720TCPStateMachine);
+                TCP_Init_flag = 0;
+                N720TCPStateMachine = Enum_N720_Close_TCP;
+                delay = TCP_Success;
+            }
+            else 
+            {
+                N720TCPStateMachine = Enum_N720_Close_TCP;
+                delay = 1000;              
+            }            
+        }
+        break;
+      default:
+        break;
+    }
+    
+    return delay;
+}
+
+uint32_t N720_SMS_Init(void)
+{
+    uint32_t delay = 0;
+    static Enum_N720_SMS N720SMSStateMachine = Enum_N720_Set_SMS_Mode;
+    static uint8_t SMS_Init_flag = 0;
+    
+    switch (N720SMSStateMachine)
+    {
+      case Enum_N720_Set_SMS_Mode:      //设置短信模式
+        {
+            printf("**********Enum_N720_Set_SMS_Mode*************\n");
+            SMS_Init_flag++;            //初始化SMS计数
+            if (N720_Set_SMS_Mode() == true)
+            {
+                delay = 1000;
+                N720SMSStateMachine = Enum_N720_Set_Char;
+            }
+            else 
+            {
+                delay = 1000;
+                N720SMSStateMachine = Enum_N720_Set_SMS_Mode;                
+            }
+            
+            if(SMS_Init_flag > 3)       //初始化超过三次 失败
+            {
+                SMS_Init_flag = 0;
+                delay = SMS_Fail;
+                N720SMSStateMachine = Enum_N720_Set_SMS_Mode;
+            }
+        }
+        break;
+      case Enum_N720_Set_Char:      //设置字符集
+        {
+            printf("**********Enum_N720_Set_Char*************\n");
+                        
+            if (N720_Set_Char() == true)
+            {
+                delay = 1000;
+                N720SMSStateMachine = Enum_N720_Reporting_Mode;
+            }
+            else 
+            {
+                delay = 1000;
+                N720SMSStateMachine = Enum_N720_Set_SMS_Mode;                
+            }            
+        }
+        break;
+      case Enum_N720_Reporting_Mode:        //设置短信到来主动上报模式
+        {
+            printf("**********Enum_N720_Reporting_Mode*************\n");
+            
+            if (N720_Reporting_Mode() == true)
+            {
+				SMS_Init_flag = 0;
+                delay = SMS_Success;
+                N720SMSStateMachine = Enum_N720_Set_SMS_Mode;
+            }
+            else 
+            {
+                delay = 1000;
+                N720SMSStateMachine = Enum_N720_Set_SMS_Mode;                
+            }
+        }
+        break;
+      default:
+        break;
+    }
+    return delay;
+}
+
+
+uint32_t N720_JudgeAndGet(void)
+{
+    uint32_t delay = 0;
+    static uint8_t Msg_Num = 0;
+    static Enum_Message_JudgeAndGet JudgeAndGetStateMachine = Null_Type;
+    
+    static uint8_t Get_SMS_flag = 0;
+    static uint8_t Get_TCP_flag = 0;
+    
+    switch(JudgeAndGetStateMachine)
+    {
+      case Null_Type:           //空消息 等待消息到来
+        {
+            JudgeAndGetStateMachine = N720_Judge_Type(&Msg_Num);     //判断消息类型 获取消息ID号
+            delay = 0;
+        }
+        break;
+      case SMS_Type:            //获取SMS消息
+        {
+            Get_SMS_flag++;     
+            JudgeAndGetStateMachine = N720_SMS_RX(Msg_Num, SMS_MsgBuf);         //获取SMS消息
+            delay = 0;
+        }
+        break;
+      case TCP_Type:            //获取TCP消息
+        {
+            Get_TCP_flag++;
+            JudgeAndGetStateMachine = N720_TCP_RX(TCPbuf.buf, TCPbuf.len);      //获取TCP消息
+            delay = 0;
+        }
+        break;
+      case Get_SMS_Success:     //接收SMS消息成功
+        {
+            OSSemPost(SempSMSRx);     //传递信号量 SMS 
+            N720_SMS_Delete();
+            delay = Msg_Finish;
+            JudgeAndGetStateMachine = Null_Type;
+        }
+        break;
+      case SMS_Error:           //接收SMS消息错误
+        {
+            N720_SMS_Delete();      //清除错误消息
+            delay = Msg_Finish;
+            JudgeAndGetStateMachine = Null_Type;
+        }
+        break;
+      case Get_SMS_Fail:        //接收SMS消息失败 重试3次
+        {
+            if(Get_SMS_flag > 3)
+            {
+                Get_SMS_flag = 0;
+                delay = Msg_Fail;
+                JudgeAndGetStateMachine = Null_Type;
+            }
+            else
+            {
+                delay = 0;
+                JudgeAndGetStateMachine = SMS_Type;     //再次获取SMS消息
+            }
+        }
+        break;
+      case Get_TCP_Success:     //接收TCP消息成功
+        {
+            OSSemPost(SempTCPRx);     //传递信号量 TCP 
+            delay = Msg_Finish;
+            JudgeAndGetStateMachine = Null_Type;
+        }
+        break;
+      case TCP_Error:           //接收TCP消息错误
+        {
+            
+        }
+        break;
+      case Get_TCP_Fail:        //接收TCP消息失败 重试3次
+        {
+            if(Get_TCP_flag > 3)
+            {
+                Get_TCP_flag = 0;
+                delay = Msg_Fail;
+                JudgeAndGetStateMachine = Null_Type;
+            }
+            else
+            {
+                delay = 0;
+                JudgeAndGetStateMachine = TCP_Type;     //再次获取TCP消息
+            }
+        }
+        break;
+        
+        
+      default:
+        break;
+    }
+    
+    
+    
+    
+    
+    
+    
+    return delay;
+}

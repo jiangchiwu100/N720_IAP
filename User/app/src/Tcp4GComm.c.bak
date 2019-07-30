@@ -1,0 +1,591 @@
+#include "includes.h"
+
+OS_STK AppTaskTCPCommStk[APP_TASK_TCPComm_STK_SIZE];	
+
+void AppTaskTCPComm(void *p_arg)
+{
+  static uint32_t TCPCommDelay = 1000;
+  (void)p_arg;	 /* 避免编译器告警 */
+
+  
+  while (1) 
+  {
+      if(R_State(&SysState,TCPRegister) == true)	//4G已经初始化成功
+      {
+          TCPCommDelay = TCP_Comm();//TCP_Comm
+          if(TCPCommDelay == Task_Suspend)      //通讯失败 3分钟后重新通讯
+          {
+              OSTimeDly(3*60*1000);
+          }
+          else
+          {
+              OSTimeDly(TCPCommDelay);
+          }
+      }
+      else
+      {
+          OSTimeDly(1000);
+      }
+  }
+}
+
+
+
+uint32_t TCP_Comm(void)
+{
+    uint32_t delay = 0;
+    static Enum_TCP_Comm TCPCommStateMachine = Enum_TCP_Login_Terminal;
+    static uint8_t Login_Loop = 0;
+    static uint8_t RxTx_Loop = 0;
+    INT8U   err; 
+    
+    static Str_GW3761_Comm tx;
+    static Str_TCP rx;
+    Str_GW3761 msg;
+    static uint8_t TCP_RX_Loop = 0;
+    switch(TCPCommStateMachine)
+    {
+      case Enum_TCP_Login_Terminal:    //登录终端
+        {
+            delay = TCP_Login_Terminal();
+            if(delay == Login_Success)  //登录成功 等待接收数据
+            {
+                delay = 0;
+                TCPCommStateMachine = Enum_TCP_Comm_RX;
+            }
+            
+            else if(delay == Login_Fail)     //登录失败 挂起任务 重新初始化
+            {
+                delay = Task_Suspend;
+                TCPCommStateMachine = Enum_TCP_Login_Terminal;
+            }
+            
+            else        //中间过程 登录还未完成
+            {
+                TCPCommStateMachine = Enum_TCP_Login_Terminal;
+            }
+        }
+        break;
+      case Enum_TCP_Send_Heartbeat:    //发送心跳包
+        {
+            delay = TCP_HeartBeat();
+            if(delay == HeartBeat_Success)  //登录成功 等待接收数据
+            {
+                delay = 0;
+                TCPCommStateMachine = Enum_TCP_Comm_RX;
+            }
+            
+            else if(delay == HeartBeat_Fail)     //登录失败 挂起任务 重新初始化
+            {
+                delay = Task_Suspend;
+                TCPCommStateMachine = Enum_TCP_HeartBeat_Terminal;
+            }
+            
+            else        //中间过程 登录还未完成
+            {
+                TCPCommStateMachine = Enum_TCP_HeartBeat_Terminal;
+            }
+
+        }
+        break;
+      case Enum_TCP_Comm_RX:        //TCP接收数据
+        {
+            OSSemPend(SempTCPRx, 6000, &err);
+            if( err != OS_ERR_TIMEOUT ) //接收到数据后进行处理
+            {
+                RxTx_Loop = 0;
+                GW3761_Frame_Resolve(TCPbuf.buf, TCPbuf.len, &msg); //解析主站数据帧
+                GW3761_Frame_Comb(&tx,&msg);                        //组帧
+                Insert_N720_Message_Q(tx.buf, tx.len);              //填入发送对列
+                delay = 0;
+                TCPCommStateMachine = Enum_TCP_Comm_TX; //进行发送
+            }
+            else                        //接收超时  主站无数据下发  开始向上发送数据
+            {                            
+                delay = 0;
+                TCPCommStateMachine = Enum_TCP_Comm_TX;
+                if(RxTx_Loop > 10)//接收发送循环超过十次 无数据交互 开始发送心跳包
+                {
+                    RxTx_Loop = 0;
+                    delay = 0;
+                    TCPCommStateMachine = Enum_TCP_Send_Heartbeat;
+                }
+            }                
+        }
+        break;
+      case Enum_TCP_Comm_TX:        //TCP发送数据
+        {
+            delay = TCP_Comm_TX();
+            if(delay == CommTX_Empty)       //发送队列空 开始接收数据
+            {
+                RxTx_Loop++;
+                delay = 0;
+                TCPCommStateMachine = Enum_TCP_Comm_RX;
+            }
+            else if(delay == CommTX_Fail)       //发送失败 重新初始化模块 挂起任务
+            {
+                delay = Task_Suspend;
+                TCPCommStateMachine = Enum_TCP_Login_Terminal;
+            }
+            else if(delay == CommTX_Finish)        //当前数据发送完成 继续发送
+            {
+                delay = 0;
+                TCPCommStateMachine = Enum_TCP_Comm_TX;
+            }
+            else   													 //中间过程 正在发送数据
+            {
+                TCPCommStateMachine = Enum_TCP_Comm_TX;
+            }
+        }
+        break;
+        
+      default:
+        break;
+    }
+    return delay;
+}
+
+uint32_t TCP_Login_Terminal(void)
+{
+    uint32_t delay = 0;
+    INT8U   err;
+    static uint8_t Login_Loop = 0;
+    static Enum_TCP_Login TCPLoginStateMachine = Enum_TCP_Send_Login;
+    
+    Str_GW3761_Comm tx;
+    Str_GW3761 msg;
+    Str_Calendar rtc;
+    
+    Str_TCP rx;
+    
+    switch(TCPLoginStateMachine)
+    {
+      case Enum_TCP_Send_Login:     //发送登录帧
+        {
+            RS8025T_Get_Calendar_Time(&rtc);
+            
+            msg.Rtc = rtc;
+            msg.FrameTypes = TerminalLogin;            
+            msg.FrameNum = GW3761DatFrameSeqNum;            
+            
+            GW3761_Frame_Comb(&tx,&msg);
+            
+            if(N720_TCP_Send(tx.buf, tx.len) == true)//数据发送成功 马上解析接收数据
+            {
+                delay = 0;
+                TCPLoginStateMachine = Enum_Login_Rec_Reply;
+            }
+            else                                    //数据发送失败后 重发数据
+            {                
+                delay = 1000;
+                TCPLoginStateMachine = Enum_TCP_Send_Login;
+            }
+            if(Login_Loop++ >= 3)//登录三次不成功 登录失败
+            {
+                Login_Loop = 0;
+                delay = Login_Fail;
+                TCPLoginStateMachine = Enum_TCP_Send_Login;
+            }
+        }
+        break;
+      case Enum_Login_Rec_Reply:    //接收回应数据帧
+        {
+            OSSemPend(SempTCPRx, 5000, &err);
+            printf("\nEnum_Login_Rec_Reply\n");
+            if( err != OS_ERR_TIMEOUT )//等待主站数据帧 
+            {  
+                /****************接收到数据后进行处理********************/
+                GW3761_Frame_Resolve(TCPbuf.buf, TCPbuf.len, &msg);
+//                Sx1278_Lora_Tx_Data(&tx.buf[0],tx.len,Sx1278_Calculated_Cad_Preamble(750));//前导码 750ms
+                if(msg.FrameTypes == Confirm)//收到确认帧 登录终端成功
+                {
+                    Login_Loop = 0;
+                    delay = Login_Success;
+                    TCPLoginStateMachine = Enum_TCP_Send_Login;
+                }
+                else                        //确认帧有误 再次发送登录帧
+                {
+                    delay = 1000;
+                    TCPLoginStateMachine = Enum_TCP_Send_Login;
+                }
+            }
+            else                        //等待超时 主站无响应 重新发送登录帧                
+            {
+                delay = 1000;
+                TCPLoginStateMachine = Enum_TCP_Send_Login;
+            }
+        }
+        break;
+      default:
+        break;
+    }
+    return delay;
+}
+
+
+uint32_t TCP_HeartBeat(void)
+{
+    uint32_t delay = 0;
+    INT8U   err;
+    static uint8_t HeartBeat_Loop = 0;
+    static Enum_TCP_HeartBeat TCPHeartBeatStateMachine = Enum_TCP_Send_HeartBeat;
+    
+    Str_GW3761_Comm tx;
+    Str_GW3761 msg;
+    Str_Calendar rtc;
+    
+    Str_TCP rx;
+    
+    switch(TCPHeartBeatStateMachine)
+    {
+      case Enum_TCP_Send_HeartBeat:     //发送心跳帧
+        {
+            RS8025T_Get_Calendar_Time(&rtc);
+            
+            msg.Rtc = rtc;
+            msg.FrameTypes = GateWayHeartBeat;            
+            msg.FrameNum = GW3761DatFrameSeqNum;            
+            
+            GW3761_Frame_Comb(&tx,&msg);
+            
+            if(N720_TCP_Send(tx.buf, tx.len) == true)//数据发送成功 马上解析接收数据
+            {
+                delay = 0;
+                TCPHeartBeatStateMachine = Enum_HeartBeat_Rec_Reply;
+            }
+            else                                    //数据发送失败后 重发数据
+            {                
+                delay = 1000;
+                TCPHeartBeatStateMachine = Enum_TCP_Send_HeartBeat;
+            }
+            if(HeartBeat_Loop++ >= 3)//心跳三次不成功 和主站失去连接
+            {
+                HeartBeat_Loop = 0;
+                delay = HeartBeat_Fail;
+                TCPHeartBeatStateMachine = Enum_TCP_Send_HeartBeat;
+            }
+        }
+        break;
+      case Enum_HeartBeat_Rec_Reply:    //接收回应数据帧
+        {
+            OSSemPend(SempTCPRx, 5000, &err);
+            printf("\nEnum_HeartBeat_Rec_Reply\n");
+            if( err != OS_ERR_TIMEOUT )//等待主站数据帧 
+            {  
+                /****************接收到数据后进行处理********************/
+                GW3761_Frame_Resolve(TCPbuf.buf, TCPbuf.len, &msg);
+//                Sx1278_Lora_Tx_Data(&tx.buf[0],tx.len,Sx1278_Calculated_Cad_Preamble(750));//前导码 750ms
+                if(msg.FrameTypes == Confirm)//收到确认帧 发送心跳成功
+                {
+                    HeartBeat_Loop = 0;
+                    delay = HeartBeat_Success;
+                    TCPHeartBeatStateMachine = Enum_TCP_Send_HeartBeat;
+                }
+                else                        //确认帧有误 再次发送心跳帧
+                {
+                    delay = 1000;
+                    TCPHeartBeatStateMachine = Enum_TCP_Send_HeartBeat;
+                }
+            }
+            else                        //等待超时 主站无响应 重新发送心跳帧                
+            {
+                delay = 1000;
+                TCPHeartBeatStateMachine = Enum_TCP_Send_HeartBeat;
+            }
+        }
+        break;
+      default:
+        break;
+    }
+    return delay;
+}
+
+uint32_t TCP_Comm_TX(void)
+{
+    uint32_t delay = 0;
+    static Enum_TCP_TX TCPTxStateMachine = Enum_Read_Send_Queue;
+    static uint8_t TX_Loop = 0;
+    static Str_TCP tx;
+    static Str_TCP rx;
+    INT8U   err;
+    Str_GW3761 msg;
+    switch(TCPTxStateMachine)
+    {
+      case Enum_Read_Send_Queue:    //读取发送队列
+        {
+            tx.len = Get_N720_Message_Q_Dat(tx.buf); 
+            if(tx.len != false)//判断发送队列中数据是否为空 不为空则马上进行发送
+            {
+                delay = 0;
+                TCPTxStateMachine = Enum_TCP_Send_Data;
+            }
+            else               //为空 退出状态机
+            {
+                delay = CommTX_Empty;
+                TX_Loop = 0;
+                TCPTxStateMachine = Enum_Read_Send_Queue;
+            }            
+        }
+        break;
+      case Enum_TCP_Send_Data:      //发送数据
+        {            
+            if(N720_TCP_Send(tx.buf, tx.len) == true)//数据发送成功 马上解析接收数据
+            {
+                TX_Loop = 0;
+                delay = 0;
+                TCPTxStateMachine = Enum_Wait_Rec_Reply;
+            }
+            else                                     //发送失败 再次发送
+            {
+                TX_Loop++;
+                delay = 1000;
+                TCPTxStateMachine = Enum_TCP_Send_Data;
+            }
+            
+            if(TX_Loop > 3)//发送尝试发送超过3次 失败 模块出现问题 重新初始化
+            {
+                TX_Loop = 0;
+                delay = CommTX_Fail;
+                TCPTxStateMachine = Enum_Read_Send_Queue;
+            }
+        }
+        break;
+      case Enum_Wait_Rec_Reply:     //等待主站回复确认帧
+        {
+            OSSemPend(SempTCPRx, 5000, &err);    
+            if( err != OS_ERR_TIMEOUT )//接收到数据后进行处理
+            { 
+                GW3761_Frame_Resolve(TCPbuf.buf, TCPbuf.len, &msg);
+                
+                if(msg.FrameTypes == Confirm)   //收到确认帧 数据发送成功
+                {
+                    printf("\ntx.len:%d\n", tx.len);
+                    TX_Loop = 0;
+                    delay = CommTX_Finish;
+                    TCPTxStateMachine = Enum_Read_Send_Queue;
+                }
+                else                            //失败 再次发送数据
+                {
+                    TX_Loop++;
+                    delay = 1000;
+                    TCPTxStateMachine = Enum_TCP_Send_Data;
+                }
+            }
+            else                      //接收超时 没有收到数据
+            {
+                TX_Loop++;
+                delay = 1000;
+                TCPTxStateMachine = Enum_TCP_Send_Data;
+            }
+        }
+        break;
+      default:
+        break;
+    }
+
+    
+    return delay;
+}
+
+//uint32_t TCP_Comm_RX(void)
+//{
+//    uint32_t delay = 0;
+//    static uint32_t RX_loop = 0;
+//    static Enum_TCP_RX TCPRxStateMachine = Enum_TCP_Get_Msg;
+//    static Str_TCP tx;
+//    static Str_TCP rx;
+//    Str_GW3761 msg;
+//    INT8U   err;
+//    
+//    switch(TCPRxStateMachine)
+//    {
+//      case Enum_Reply:		//需要回应
+//        {
+//            rx.len = N720_TCP_RX(rx.buf);
+//            GW3761_Frame_Comb(&tx,&msg);
+//            GW3761_Frame_Resolve(rx.buf, rx.len, &msg);
+//            if()//需要回应 
+//            {
+//                if(N720_TCP_Send(tx.buf, tx.len) == true)   //数据发送成功 马上解析接收数据
+//                {
+//                    RX_loop = 0;
+//                    delay = 0;
+//                    TCPTxStateMachine = Enum_Wait_Rec_Reply;
+//                }
+//                else        //发送失败 再次发送
+//                {
+//                    RX_loop++;
+//                    delay = 1000;
+//                    TCPTxStateMachine = Enum_TCP_Send_Data;
+//                }                
+//                if(RX_loop > 3)   //发送尝试发送超过3次 失败 模块出现问题 重新初始化
+//                {
+//                    RX_loop = 0;
+//                    delay = CommRX_Fail;
+//                    TCPTxStateMachine = Enum_Reply;
+//                }                
+//            }
+//        }
+//        break;
+//      case Enum_Wait_Reply:		//等待确认帧
+//        {
+//            OSSemPend(SempN720Rx, 5000, &err);    
+//            if( err != OS_ERR_TIMEOUT )     //接收到数据后进行处理
+//            { 
+//                rx.len = N720_TCP_RX(rx.buf);
+//                GW3761_Frame_Resolve(rx.buf, rx.len, &msg);
+//                
+//                if(msg.FrameTypes == Confirm)       //收到确认帧 
+//                {
+//                    printf("\ntx.len:%d\n", tx.len);
+//                    delay = CommRX_Finish;
+//                    TCPTxStateMachine = Enum_Reply
+//                }
+//                else        //失败 再次发送数据
+//                {
+//                    TX_Loop++;
+//                    delay = 1000;
+//                    TCPTxStateMachine = Enum_TCP_Send_Data;
+//                }
+//            }
+//            else    //接收超时 没有收到数据
+//            {
+//                TX_Loop++;
+//                delay = 1000;
+//                TCPTxStateMachine = Enum_TCP_Send_Data;
+//            }
+//        }
+//        break;
+//      default:
+//        break;
+//    }
+//}
+
+
+//uint32_t N720_RxMsg(void)
+//{
+//    uint32_t delay = 0;
+//    static uint8_t Type = 0;
+//    static Enum_N720_RxMsg N720RxMsgStateMachine = Enum_N720_Judge_Msg_Type;
+//    static uint8_t Num = 0;
+//    static SMS_Ctrl ctrl_mode = 0;
+//    static uint8_t TCP_buf[255] = {0};
+//    
+//    static Str_TCP TCP_Rx;
+//    
+//    static uint8_t TCP_Tx_flag = 0;
+//    
+//    switch (N720RxMsgStateMachine)
+//    {
+//      case Enum_N720_Judge_Msg_Type:   // 判断消息类型
+//        {
+//            printf("*******Enum_N720_Judge_Msg_Type**********\n\r");
+//            Type = N720_Judge_Type(&Num);       //解析上报内容 判断消息类型
+//            
+//            if(Type == 1)     //收到短信消息  马上获取消息
+//            {
+//                delay = 0;
+//                N720RxMsgStateMachine = Enum_N720_Get_SMS_Msg;
+//            } 
+//            else if(Type == 2)    //收到TCP消息  马上获取消息
+//            {
+//                delay = 0;
+//                N720RxMsgStateMachine = Enum_N720_Get_TCP_Msg;
+//            }
+//            else            //无消息
+//            {
+//                delay = CommRx_Empty;
+//                N720RxMsgStateMachine = Enum_N720_Judge_Msg_Type;                
+//            }
+//        }
+//        break;
+//      case Enum_N720_Get_SMS_Msg:       //获取短信内容
+//        {
+//            ctrl_mode = N720_SMS_RX(Num);       //获取短信内容 提取控制码
+//            
+//            if (ctrl_mode == false)     //表明短信获取失败  重新初始N720
+//            {
+//                delay = CommRX_Fail;
+//                N720RxMsgStateMachine = Enum_N720_Judge_Msg_Type;
+//            }
+//            else if(ctrl_mode == SMS_Error)     //表明短信内容错误
+//            {
+//                N720_SMS_Delete();     //清除所有存储短信
+//                delay = 3000;
+//                N720RxMsgStateMachine = Enum_N720_Judge_Msg_Type;    
+//            }
+//            else if(ctrl_mode == SMS_Info_Set)      //短信控制位是配置模块信息
+//            {
+//                delay = Task_Suspend;		//直接传递 挂起自身 恢复初始化任务
+//                N720RxMsgStateMachine = Enum_N720_Judge_Msg_Type;
+//            }
+//            else if(ctrl_mode == SMS_IAP_Ctrl)      //短信控制位是进行IAP 程序跳转到BootLoader中
+//            {
+//                iap_load_app();
+//            }
+//            
+//            if(Num > 2)    //短信过多（TCP ID只可能为0）
+//            {
+//                Num = 0;
+//                N720_SMS_Delete();     //清除所有存储短信
+//                delay = 3000;
+//            }  
+//        }
+//        break;
+//      case Enum_N720_Get_TCP_Msg:       //获取TCP内容   
+//        {
+//            //N720_TCP_RX
+//            TCP_Rx.len = N720_TCP_RX(TCP_Rx.buf);            
+////            TCP_Tx_flag = N720_TCP_Send(TCP_Rx.buf, TCP_Rx.len);
+//            if(TCP_Rx.len != false)     //获取数据成功 
+//            {
+//                delay = CommRX_Finish;
+//                N720RxMsgStateMachine = Enum_N720_Judge_Msg_Type;
+//            }
+//            else        //失败 重新获取数据
+//            {
+//                delay = CommRX_Fail;
+//                N720RxMsgStateMachine = Enum_N720_Get_TCP_Msg;
+//            }
+//        }
+//        break;
+//      default:
+//        break;
+//    }
+//    return delay;
+//}
+
+
+/*
+终端登录
+//    Str_GW3761 msg;
+//    static Str_GW3761_Comm tx;
+//    Str_Calendar rtc;
+//    
+//    RS8025T_Get_Calendar_Time(&rtc);
+//    msg.FrameTypes = TerminalLogin;
+//    msg.Rtc = rtc;
+//    msg.FrameNum = GW3761DatFrameSeqNum;
+//    
+//    GateWayID[0]=0;
+//    GateWayID[1]=5;
+//    GW3761_Frame_Comb(&tx,&msg);
+
+*/
+
+/*
+心跳上行 
+//    Str_GW3761 msg;
+//    static Str_GW3761_Comm tx;
+//    Str_Calendar rtc;
+//    
+//    RS8025T_Get_Calendar_Time(&rtc);
+//    msg.FrameTypes = GateWayHeartBeat;
+//    msg.Rtc = rtc;
+//    msg.FrameNum = GW3761DatFrameSeqNum;
+//    
+//    GateWayID[0]=0;
+//    GateWayID[1]=5;
+//    GW3761_Frame_Comb(&tx,&msg);
+
+*/
